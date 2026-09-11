@@ -6,6 +6,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // ---- defaults (all changeable at runtime via /cache-guard, persisted globally) ----
 const NOISE_FLOOR_TOKENS = 1024; // below this, ignore entirely (breakpoint granularity noise)
+// Match pi's cache-miss classification: gaps at or above the provider's usual
+// five-minute cache TTL are labelled as misses after idle.
+const CACHE_TTL_MS = 5 * 60 * 1000;
+// Ignore expected invalidations by default; disable this when model-switch and
+// idle-related misses should count toward the guard too.
+const DEFAULT_ACTUAL_MISSES_ONLY = true;
 // A miss only counts toward the guard once it's "significant" — mirrors pi's own
 // addCacheMissNotice() gate in interactive-mode.js, so the guard's counters match
 // what you'd actually see flagged as a yellow "Cache miss" banner in the transcript.
@@ -21,12 +27,15 @@ const SETTINGS_PATH = join(SETTINGS_DIR, "cache-guard-settings.json");
 interface PrevRequest {
   promptTokens: number;
   reportedCache: boolean;
+  timestamp: number;
+  modelKey: string;
 }
 
 /** Persisted globally in SETTINGS_PATH, shared across all sessions/projects. */
 interface GuardSettings {
   enabled: boolean;
   logging: boolean;
+  actualMissesOnly: boolean;
   significantMissTokens: number;
   significantMissCost: number;
   maxConsecutiveMisses: number;
@@ -48,6 +57,7 @@ function defaultSettings(): GuardSettings {
   return {
     enabled: true,
     logging: true,
+    actualMissesOnly: DEFAULT_ACTUAL_MISSES_ONLY,
     significantMissTokens: DEFAULT_SIGNIFICANT_MISS_TOKENS,
     significantMissCost: DEFAULT_SIGNIFICANT_MISS_COST,
     maxConsecutiveMisses: DEFAULT_MAX_CONSECUTIVE_MISSES,
@@ -64,6 +74,8 @@ function loadSettings(): GuardSettings {
     return {
       enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : defaults.enabled,
       logging: typeof parsed.logging === "boolean" ? parsed.logging : defaults.logging,
+      actualMissesOnly:
+        typeof parsed.actualMissesOnly === "boolean" ? parsed.actualMissesOnly : defaults.actualMissesOnly,
       significantMissTokens:
         Number.isFinite(parsed.significantMissTokens) && parsed.significantMissTokens >= 0
           ? parsed.significantMissTokens
@@ -99,6 +111,7 @@ function saveSettings(settings: GuardSettings) {
         {
           enabled: settings.enabled,
           logging: settings.logging,
+          actualMissesOnly: settings.actualMissesOnly,
           significantMissTokens: settings.significantMissTokens,
           significantMissCost: settings.significantMissCost,
           maxConsecutiveMisses: settings.maxConsecutiveMisses,
@@ -134,7 +147,7 @@ function resetCounters(state: GuardState) {
 function statusLine(state: GuardState): string {
   if (!state.enabled) return "cache-guard: disabled (global)";
   return (
-    `cache-guard: on (global, logging ${state.logging ? "on" : "off"}) | significant miss >= ${state.significantMissTokens} tok or $${state.significantMissCost.toFixed(2)} | ` +
+    `cache-guard: on (global, logging ${state.logging ? "on" : "off"}, actual-only ${state.actualMissesOnly ? "on" : "off"}) | significant miss >= ${state.significantMissTokens} tok or $${state.significantMissCost.toFixed(2)} | ` +
     `streak ${state.consecutiveMisses}/${state.maxConsecutiveMisses} | ` +
     `total ${state.totalMisses}/${state.maxTotalMisses} | ` +
     `$${state.cumulativeMissCost.toFixed(2)}/$${state.maxCumulativeMissCost.toFixed(2)}`
@@ -174,11 +187,23 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify(enabled ? "cache-guard enabled globally" : "cache-guard disabled globally", enabled ? "info" : "warning");
   }
 
-  const SUBCOMMANDS = ["status", "on", "off", "log", "reset", "consecutive", "max", "cost", "significant-tokens", "significant-cost"];
+  const SUBCOMMANDS = [
+    "status",
+    "on",
+    "off",
+    "log",
+    "reset",
+    "actual-only",
+    "consecutive",
+    "max",
+    "cost",
+    "significant-tokens",
+    "significant-cost",
+  ];
 
   pi.registerCommand("cache-guard", {
     description:
-      "Configure the global prompt-cache-miss guardrail (status|on|off|log on|off|reset|consecutive N|max N|cost N|significant-tokens N|significant-cost N)",
+      "Configure the global prompt-cache-miss guardrail (status|on|off|log on|off|reset|actual-only on|off|consecutive N|max N|cost N|significant-tokens N|significant-cost N)",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const items = SUBCOMMANDS.map((s) => ({ value: s, label: s }));
       const filtered = items.filter((i) => i.value.startsWith(prefix));
@@ -216,6 +241,27 @@ export default function (pi: ExtensionAPI) {
         case "reset": {
           resetCounters(state);
           ctx.ui.notify("cache-guard counters reset for this session", "info");
+          return;
+        }
+        case "actual-only": {
+          const value = rest[0]?.toLowerCase();
+          if (value !== "on" && value !== "off") {
+            ctx.ui.notify("Usage: /cache-guard actual-only <on|off>", "error");
+            return;
+          }
+          state.actualMissesOnly = value === "on";
+          // Do not mix counters collected under the old miss classification
+          // with counters collected under the new one.
+          resetCounters(state);
+          persist();
+          ctx.ui.notify(
+            `cache-guard actual-only mode turned ${value} (global); ${
+              state.actualMissesOnly
+                ? "misses after idle or model switches will be ignored"
+                : "misses after idle or model switches will be counted"
+            }`,
+            "info",
+          );
           return;
         }
         case "consecutive": {
@@ -302,6 +348,13 @@ export default function (pi: ExtensionAPI) {
 
     if (promptTokens <= 0) return;
 
+    const currentRequest: PrevRequest = {
+      promptTokens,
+      reportedCache: reportedCacheNow,
+      timestamp: msg.timestamp,
+      modelKey: `${msg.provider}/${msg.model}`,
+    };
+
     // Only count once a provider has shown cache activity at least once
     // (avoids false positives on providers/models that never cache).
     if (state.prev && (reportedCacheNow || state.prev.reportedCache)) {
@@ -320,7 +373,17 @@ export default function (pi: ExtensionAPI) {
         // in the transcript instead of tripping on misses you never saw flagged.
         const isSignificant = missed >= state.significantMissTokens || missedCost >= state.significantMissCost;
         if (!isSignificant) {
-          state.prev = { promptTokens, reportedCache: reportedCacheNow };
+          state.prev = currentRequest;
+          return;
+        }
+
+        const modelChanged = currentRequest.modelKey !== state.prev.modelKey;
+        const idleMs = Math.max(0, currentRequest.timestamp - state.prev.timestamp);
+        if (state.actualMissesOnly && (modelChanged || idleMs >= CACHE_TTL_MS)) {
+          // Pi describes these as "Cache miss after model switch" or "Cache
+          // miss after ... idle". They are expected cache invalidations, not
+          // unexplained misses, so leave them out of all guard counters.
+          state.prev = currentRequest;
           return;
         }
 
@@ -366,6 +429,6 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    state.prev = { promptTokens, reportedCache: reportedCacheNow };
+    state.prev = currentRequest;
   });
 }

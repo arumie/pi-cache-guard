@@ -1,6 +1,6 @@
 # Cache Guard for pi
 
-`@arumie/pi-cache-guard` is a pi package that watches assistant usage and stops an active run after repeated, significant prompt-cache misses. It helps prevent a transient cache failure, model change, or prompt-prefix change from silently accumulating expensive re-billed input.
+`@arumie/pi-cache-guard` is a pi package that watches assistant usage and stops an active run after repeated, significant prompt-cache misses. It helps prevent a transient cache failure, model change, or prompt-prefix change from silently accumulating expensive re-billed input. By default, misses caused by a model switch or a five-minute-plus idle gap do not count; disable actual-only mode if those misses should be included.
 
 > **Security:** pi extensions run with your user permissions. Install this package only from a source you trust.
 
@@ -9,7 +9,7 @@
 Install a pinned Git release:
 
 ```sh
-pi install git:github.com/arumie/pi-cache-guard@v1.0.0
+pi install git:github.com/arumie/pi-cache-guard@v1.1.0
 ```
 
 Restart pi (or run `/reload`) after installing. Confirm the package is registered with `pi list`.
@@ -36,6 +36,7 @@ Settings are global across pi projects and sessions, stored at `~/.pi/agent/cach
 - `/cache-guard on|off` — enable or disable the guard globally.
 - `/cache-guard log on|off` — control routine cache-hit and cache-miss notifications globally.
 - `/cache-guard reset` — clear this session's counters.
+- `/cache-guard actual-only on|off` — ignore misses after model switches or five-minute-plus idle gaps when on; only unexplained cache misses count.
 - `/cache-guard consecutive N` — stop after `N` significant consecutive misses.
 - `/cache-guard max N` — stop after `N` significant misses in the session.
 - `/cache-guard cost N` — stop after `N` dollars of estimated cumulative re-billed input.
@@ -46,13 +47,14 @@ A miss is significant when it meets **either** the token or cost threshold. Defa
 
 | Setting | Default |
 | --- | ---: |
+| Actual-only mode | On |
 | Significant miss tokens | 20,000 |
 | Significant miss cost | $0.10 |
 | Consecutive misses | 3 |
 | Total misses | 8 |
 | Cumulative re-billed cost | $0.50 |
 
-If the guard stops a run, inspect likely cache-invalidating changes (such as switching models or thinking level) and wait for cache recovery before using `/cache-guard reset` to start counting again.
+If actual-only mode is off and the guard stops a run, inspect likely cache-invalidating changes (such as switching models or thinking level) and wait for cache recovery before using `/cache-guard reset` to start counting again. With actual-only mode on, significant misses caused by a model switch or a five-minute-plus idle gap are ignored; only other significant misses update the counters.
 
 ## Development and validation
 
@@ -70,8 +72,8 @@ Git tags are the release mechanism:
 1. Update `package.json`'s version, `CHANGELOG.md`, and documentation.
 2. Run `npm run release:check`.
 3. Commit and push `main`.
-4. Create and push an annotated semantic-version tag, for example `v1.0.0`.
-5. Install that exact revision with `pi install git:github.com/arumie/pi-cache-guard@v1.0.0`.
+4. Create and push an annotated semantic-version tag, for example `v1.1.0`.
+5. Install that exact revision with `pi install git:github.com/arumie/pi-cache-guard@v1.1.0`.
 
 A Git ref in `pi install` is pinned. `pi update --extensions` reconciles the configured ref but does not advance it to a newer tag; install the new tag explicitly when upgrading. Remove the package with:
 
